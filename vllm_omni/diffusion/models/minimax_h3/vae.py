@@ -403,9 +403,28 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
 
     @torch.inference_mode()
     def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        import os as _os
+
+        _dbg = _os.environ.get("H3_STAGE_DBG") == "1"
+        if _dbg:
+            logger.info(
+                "STAGEDBG vae_in rank=%s lat=%.6e shape=%s wparam_dtype=%s",
+                dist.get_rank() if dist.is_initialized() else 0,
+                latent.float().abs().sum().item(),
+                tuple(latent.shape),
+                next(self.model.parameters()).dtype,
+            )
         with self._decode_tiling_context(latent):
             decoded = self.model.decode_base(self._denormalize_latent(latent))
-        return self._normalize_decoded_frames(self.model.processor.revert_tensor(decoded))
+        out = self._normalize_decoded_frames(self.model.processor.revert_tensor(decoded))
+        if _dbg:
+            logger.info(
+                "STAGEDBG vae_out rank=%s chk=%.6e shape=%s",
+                dist.get_rank() if dist.is_initialized() else 0,
+                out.float().abs().sum().item(),
+                tuple(out.shape),
+            )
+        return out
 
     def _denormalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
         channels = int(self.config_dict["latent_channels"])

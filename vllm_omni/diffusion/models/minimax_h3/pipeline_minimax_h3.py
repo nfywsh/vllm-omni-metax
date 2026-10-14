@@ -405,10 +405,21 @@ def _prepare_minimax_h3_video_output(video: torch.Tensor) -> torch.Tensor:
     """Quantize decoded frames in place before worker-to-engine transfer."""
     video = video.detach().float()
     video.clamp_(0, 1).mul_(255).round_()
-    return video.permute(0, 2, 3, 4, 1).to(
+    out = video.permute(0, 2, 3, 4, 1).to(
         dtype=torch.uint8,
         memory_format=torch.contiguous_format,
     )
+    if os.environ.get("H3_STAGE_DBG") == "1":
+        try:
+            logger.info(
+                "STAGEDBG quantized rank=%s u8chk=%.6e shape=%s",
+                os.getpid(),
+                out.float().abs().sum().item(),
+                tuple(out.shape),
+            )
+        except Exception:
+            pass
+    return out
 
 
 def _register_dlo_component_cache(cache: BoundedAllocatorCache, *components: Any) -> None:
@@ -2082,6 +2093,27 @@ class MiniMaxH3Pipeline(
             audio_t=audio_t * 2,
             audio_channel=2,
         )
+        if os.environ.get("H3_STAGE_DBG") == "1":
+            try:
+                _lg = logger
+                _r = 0
+                try:
+                    import torch.distributed as _dist
+
+                    if _dist.is_available() and _dist.is_initialized():
+                        _r = _dist.get_rank()
+                except Exception:
+                    pass
+                _lg.info(
+                    "STAGEDBG unpacked rank=%s vlat=%.6e alat=%.6e vshape=%s ashape=%s",
+                    _r,
+                    video_latent.float().abs().sum().item(),
+                    audio_latent.float().abs().sum().item(),
+                    tuple(video_latent.shape),
+                    tuple(audio_latent.shape),
+                )
+            except Exception:
+                pass
         return video_latent, audio_latent
 
     def diffuse(
@@ -2235,6 +2267,13 @@ class MiniMaxH3Pipeline(
             encoder.abort()
             raise
 
+    def _h3_stage_dbg_rank(self) -> int:
+        import torch.distributed as _dist
+
+        if _dist.is_available() and _dist.is_initialized():
+            return _dist.get_rank()
+        return 0
+
     def decode(
         self,
         video_latent: torch.Tensor,
@@ -2243,6 +2282,14 @@ class MiniMaxH3Pipeline(
         height: int,
         width: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        _dbg = os.environ.get("H3_STAGE_DBG") == "1"
+        if _dbg:
+            logger.info(
+                "STAGEDBG decode_in rank=%s vlat=%.6e alat=%.6e",
+                self._h3_stage_dbg_rank(),
+                video_latent.float().abs().sum().item(),
+                audio_latent.float().abs().sum().item(),
+            )
         with self._component_on_device(self.video_vae):
             with current_omni_platform.create_autocast_context(
                 device_type=self.device.type,
@@ -2250,9 +2297,30 @@ class MiniMaxH3Pipeline(
                 enabled=True,
             ):
                 video = self.video_vae.decode_latent(video_latent)
+        if _dbg:
+            logger.info(
+                "STAGEDBG video_dec rank=%s vchk=%.6e vshape=%s dtype=%s",
+                self._h3_stage_dbg_rank(),
+                video.float().abs().sum().item(),
+                tuple(video.shape),
+                video.dtype,
+            )
         video = video[..., :height, :width].contiguous()
+        if _dbg:
+            logger.info(
+                "STAGEDBG video_crop rank=%s vchk=%.6e",
+                self._h3_stage_dbg_rank(),
+                video.float().abs().sum().item(),
+            )
         with self._component_on_device(self.audio_vae):
             audio = self.audio_vae.decode_latent(audio_latent)
+        if _dbg:
+            logger.info(
+                "STAGEDBG audio_dec rank=%s achk=%.6e ashape=%s",
+                self._h3_stage_dbg_rank(),
+                audio.float().abs().sum().item(),
+                tuple(audio.shape),
+            )
         return video, audio
 
     @staticmethod

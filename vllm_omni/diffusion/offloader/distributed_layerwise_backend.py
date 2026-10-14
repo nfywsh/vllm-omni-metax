@@ -21,6 +21,7 @@ from __future__ import annotations
 import threading
 import time
 import weakref
+import os
 from collections.abc import Sequence
 from itertools import chain
 from typing import Any
@@ -613,16 +614,21 @@ class DistributedLayerwiseOffloadHook(ModelHook):
     def _wait_for_weights(self, slot: int) -> None:
         """Wait until the slot holding this block is ready for compute.
 
-        The ready event for this slot was set by the *previous* hook's
+        The data in ``slot`` was written by the *previous* hook's
         prefetch_layer (which prefetched THIS block's weights into the
-        shared buffer).  This hook's own ready_events[slot] is None because
-        it never prefetched into this slot itself.  Fall back to the
-        previous hook's event to ensure the compute stream waits for the
-        AllGather (or H2D) to complete before reading the buffer.
+        shared buffer), so the previous hook's event is the writer event.
+        This hook's own ``ready_events[slot]`` refers to an older prefetch
+        of a *different* block into the same slot — once this hook has run
+        a full pass (or group), that stale event is already complete, and
+        preferring it would let compute read the shared buffer while the
+        actual write (e.g. the async AllGather) is still in flight.  So
+        the writer event must be checked first.
         """
-        evt = self.ready_events[slot]
-        if evt is None and self._prev_hook is not None:
+        evt = None
+        if self._prev_hook is not None:
             evt = self._prev_hook.ready_events[slot]
+        if evt is None:
+            evt = self.ready_events[slot]
         if evt is not None:
             current_omni_platform.current_stream().wait_event(evt)
 
@@ -721,6 +727,21 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         # caused cascading NPU stream synchronization stalls (~10ms/layer).
         next_slot = 1 - self.current_slot
         self.prefetch_layer(next_slot, non_blocking=True)
+
+        if os.environ.get("H3_DLO_DBG") == "1":
+            probe = self._materialization_probe
+            if probe is not None and probe.numel():
+                flat = probe.reshape(-1)[:262144]
+                chk = float(flat.float().abs().sum().item())
+                logger.info(
+                    "DLODBG pre grp=%s idx=%s slot=%s mat=%s ptr=%#x chk=%.6e",
+                    getattr(self, "_dbg_group", -1),
+                    getattr(self, "_dbg_index", -1),
+                    self.current_slot,
+                    self.is_materialized,
+                    probe.data_ptr(),
+                    chk,
+                )
 
         return args, kwargs
 
@@ -1474,9 +1495,12 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
         # hooks = [last -> first, block0 -> block1, ...]. Alternating slots
         # keep a prefetch from overwriting the current block for any ring size.
+        dbg_group = len(self._all_hook_groups) - 1
         for index, hook in enumerate(hooks):
             hook._prev_hook = hooks[index - 1]
             hook.current_slot = index % 2
+            hook._dbg_group = dbg_group
+            hook._dbg_index = index
         hooks[1]._is_group_first = True
         return hooks
 

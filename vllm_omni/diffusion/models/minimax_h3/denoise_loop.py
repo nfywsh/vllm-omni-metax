@@ -13,7 +13,19 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
+import os
+
+import logging
 import torch
+
+logger = logging.getLogger(__name__)
+
+
+def _dbg_rank():
+    import torch.distributed as _dist
+    if _dist.is_available() and _dist.is_initialized():
+        return _dist.get_rank()
+    return 0
 
 from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout, VideoTokenSpan
 from vllm_omni.diffusion.forward_context import (
@@ -292,6 +304,7 @@ def minimax_h3_denoise_loop(
         raise ValueError("video/audio sigma schedules must have equal length")
     if len(sigmas_video) < 2:
         raise ValueError("sigma schedules need at least 2 entries")
+    _dbg = os.environ.get("H3_STAGE_DBG") == "1"
     # Keep CUDA/CPU on the reference path: its accuracy CI compares the
     # generated video against the official artifact. The table reuse is an
     # Ascend-specific performance optimization and must not alter that path.
@@ -309,6 +322,13 @@ def minimax_h3_denoise_loop(
     audio_update = positive.audio_update_mask_dev
 
     num_steps = len(sigmas_video) - 1
+    if _dbg:
+        iv = initial_video_rows.float().abs().sum().item()
+        ia = initial_audio_rows.float().abs().sum().item()
+        logger.info(
+            "STAGEDBG initial_rows rank=%s nvideo=%d naudio=%d vchk=%.6e achk=%.6e",
+            _dbg_rank(), initial_video_rows.shape[0], initial_audio_rows.shape[0], iv, ia,
+        )
     for step in range(num_steps):
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
         with step_cm:
@@ -335,6 +355,16 @@ def minimax_h3_denoise_loop(
                 v_video, v_audio = model(**fk)
             mv_video_t = v_video.float()[update]
             mv_audio_t = v_audio.float()[audio_update]
+
+            if _dbg:
+                logger.info(
+                    "STAGEDBG step rank=%s step=%d vrow=%.6e arow=%.6e vvel=%.6e avel=%.6e",
+                    _dbg_rank(), step,
+                    video_rows[update].float().abs().sum().item(),
+                    audio_rows[audio_update].float().abs().sum().item(),
+                    mv_video_t.abs().sum().item(),
+                    mv_audio_t.abs().sum().item(),
+                )
 
             x0_video = minimax_h3_rf_v_to_x0(
                 video_rows[update],
