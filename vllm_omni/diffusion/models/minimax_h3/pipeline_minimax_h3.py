@@ -419,6 +419,8 @@ def _prepare_minimax_h3_video_output(video: torch.Tensor) -> torch.Tensor:
             )
         except Exception:
             pass
+    # [H3-NOISE-FIX] 强制同步：确保 VAE 解码/量化异步链落地后再进行 worker->engine 传输，避免坚条噪声。
+    current_omni_platform.synchronize()
     return out
 
 
