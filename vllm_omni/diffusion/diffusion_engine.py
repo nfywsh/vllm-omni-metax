@@ -25,6 +25,7 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
+from vllm_omni.diffusion.cancellation import RequestCancellationRegistry
 from vllm_omni.diffusion.data import (
     DiffusionOutput,
     DiffusionRequestAbortedError,
@@ -179,6 +180,19 @@ def _max_num_seqs(od_config: OmniDiffusionConfig) -> int:
         return 1
 
 
+def supports_request_cancellation(od_config: OmniDiffusionConfig) -> bool:
+    """Whether the local pipeline checks cooperative cancellation boundaries."""
+    model_cls = _resolve_custom_pipeline_cls(getattr(od_config, "custom_pipeline_args", None))
+    if model_cls is None:
+        name = (
+            "DiffusersAdapterPipeline"
+            if uses_diffusers_adapter(od_config)
+            else getattr(od_config, "model_class_name", None)
+        )
+        model_cls = DiffusionModelRegistry._try_load_model_cls(name)
+    return getattr(model_cls, "supports_request_cancellation", False) is True
+
+
 def _uses_dlo_dp_concurrency(od_config: OmniDiffusionConfig) -> bool:
     parallel_config = getattr(od_config, "parallel_config", None)
     dp_size = getattr(parallel_config, "data_parallel_size", 1)
@@ -248,6 +262,9 @@ class DiffusionEngine:
         # activation envelope: (max execution sequences, max seq_len,
         # max target_len).
         self._diffusion_kv_profile_limits: tuple[int, int, int] | None = None
+        self._request_cancellations: RequestCancellationRegistry | None = (
+            RequestCancellationRegistry() if supports_request_cancellation(od_config) else None
+        )
 
         self._init_process_hooks(od_config)
         self.execution_mode = self._resolve_execution_mode(od_config)
@@ -887,6 +904,8 @@ class DiffusionEngine:
                 raise RuntimeError("DiffusionEngine is closed.")
             queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
             request_id = self.scheduler.add_request(request)
+            if self._request_cancellations is not None:
+                request.cancellation_signal = self._request_cancellations.create(request_id)
             self._out_streams[request_id] = queue
             self._cv.notify_all()
 
@@ -1267,6 +1286,8 @@ class DiffusionEngine:
                 return
             if not self._closed:
                 self._closed = True
+                if getattr(self, "_request_cancellations", None) is not None:
+                    self._request_cancellations.cancel_all()
                 if self.stop_event is not None:
                     self.stop_event.set()
                 pending_streams = list(self._out_streams.values())
@@ -1293,6 +1314,8 @@ class DiffusionEngine:
 
         self.scheduler.close()
         self.executor.shutdown()
+        if getattr(self, "_request_cancellations", None) is not None:
+            self._request_cancellations.close()
         self._shutdown_complete = True
 
     def abort(self, request_id: str | Iterable[str]) -> None:
@@ -1301,6 +1324,8 @@ class DiffusionEngine:
         with self._cv:
             if self._closed:
                 return
+            if getattr(self, "_request_cancellations", None) is not None:
+                self._request_cancellations.cancel(request_ids)
             for req_id in request_ids:
                 self.abort_queue.put(req_id)
             self._cv.notify_all()
@@ -1329,6 +1354,8 @@ class DiffusionEngine:
         for request_id in request_ids:
             if self.scheduler.get_request_state(request_id) is not None:
                 self.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+            if getattr(self, "_request_cancellations", None) is not None:
+                self._request_cancellations.finish(request_id)
 
     def _finalize_finished_request(
         self,
@@ -1336,6 +1363,8 @@ class DiffusionEngine:
         runner_output: RunnerOutput | None = None,
         missing_result_error: str = "Diffusion scheduler finished target request without execution output.",
     ) -> DiffusionOutput:
+        if getattr(self, "_request_cancellations", None) is not None:
+            self._request_cancellations.finish(request_id)
         state = self.scheduler.get_request_state(request_id)
         popped_state = self.scheduler.pop_request_state(request_id)
         state = state or popped_state
