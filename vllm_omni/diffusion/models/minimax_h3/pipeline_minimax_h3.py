@@ -95,6 +95,9 @@ from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
     resolve_minimax_h3_reference_image_shape as _reference_image_shape,
 )
+from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
+    resolve_minimax_h3_reference_short_edge as _reference_short_edge,
+)
 from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     MINIMAX_H3_PREPARED_REFERENCE_VIDEOS_KEY,
     deserialize_prepared_reference_videos,
@@ -2525,8 +2528,13 @@ class MiniMaxH3Pipeline(
             keyframe_frame_indices = _resolve_fl2va_keyframe_indices(extra, len(images))
         elif task == "ref2va":
             prepared_images = []
+            _target_cfg = extra.get("target")
+            _target_cfg = _target_cfg if isinstance(_target_cfg, Mapping) else {}
+            _ref_short_edge = _reference_short_edge(
+                _target_cfg.get("reference_short_edge", extra.get("reference_short_edge"))
+            )
             for item in images:
-                ref_width, ref_height = _reference_image_shape(item)
+                ref_width, ref_height = _reference_image_shape(item, _ref_short_edge)
                 prepared_images.append(item.resize((ref_width, ref_height), Image.Resampling.LANCZOS))
             keyframe_frame_indices = None
         else:

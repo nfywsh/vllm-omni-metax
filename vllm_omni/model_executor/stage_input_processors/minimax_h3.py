@@ -28,6 +28,7 @@ from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
     resolve_minimax_h3_aspect_ratio,
     resolve_minimax_h3_output_canvas,
     resolve_minimax_h3_reference_image_shape,
+    resolve_minimax_h3_reference_short_edge,
 )
 from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     MINIMAX_H3_PREPARED_REFERENCE_VIDEOS_KEY,
@@ -108,9 +109,16 @@ def _prepare_qwen_images(
         return []
     images = load_minimax_h3_images(values)
     if task == "ref2va":
+        sampling = _diffusion_sampling_params(sampling_params_list)
+        extra_args = sampling.extra_args or {}
+        target = extra_args.get("target")
+        target = target if isinstance(target, Mapping) else {}
+        ref_short_edge = resolve_minimax_h3_reference_short_edge(
+            target.get("reference_short_edge", extra_args.get("reference_short_edge"))
+        )
         return [
             image.resize(
-                resolve_minimax_h3_reference_image_shape(image),
+                resolve_minimax_h3_reference_image_shape(image, ref_short_edge),
                 Image.Resampling.LANCZOS,
             )
             for image in images

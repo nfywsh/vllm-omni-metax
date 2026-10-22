@@ -35,6 +35,10 @@ _VIDEO_TAG = 0
 MINIMAX_H3_OUTPUT_SHORT_EDGE = 768
 MINIMAX_H3_OUTPUT_MAX_PIXELS = 768 * 1344
 MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE = 2048
+# Lower bound for the per-request ``reference_short_edge`` override. The
+# official reference canvas is 2048; lowering it shrinks the reference token
+# budget (faster, less reference detail).
+MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_MIN = 512
 MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE = 32
 MINIMAX_H3_SUPPORTED_ASPECT_RATIOS = {
     "21:9": 21.0 / 9.0,
@@ -134,15 +138,50 @@ def resolve_minimax_h3_aspect_ratio(
     return numeric_value
 
 
-def resolve_minimax_h3_reference_image_shape(image: Image.Image) -> tuple[int, int]:
-    """Resize an H3 reference image to the official 2048-short-edge canvas."""
+def resolve_minimax_h3_reference_short_edge(value: Any) -> int:
+    """Resolve a per-request reference short-edge override (``reference_short_edge``).
+
+    ``None`` keeps the official 2048-short-edge reference canvas. Values must be
+    a multiple of 32 in [512, 2048]: lowering it shrinks the reference token
+    budget (faster, less reference detail); values above 2048 would leave the
+    official preprocessing contract and are rejected.
+    """
+    if value is None:
+        return MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE
+    if isinstance(value, bool):
+        raise OmniClientError(f"MiniMax H3 reference_short_edge must be an integer, got {value!r}")
+    try:
+        edge = int(value)
+    except (TypeError, ValueError) as exc:
+        raise OmniClientError(
+            f"MiniMax H3 reference_short_edge must be an integer, got {value!r}"
+        ) from exc
+    if edge % MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE:
+        raise OmniClientError(
+            "MiniMax H3 reference_short_edge must be a multiple of "
+            f"{MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE}, got {edge}"
+        )
+    if not MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_MIN <= edge <= MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE:
+        raise OmniClientError(
+            "MiniMax H3 reference_short_edge must be in "
+            f"[{MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_MIN}, {MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE}], got {edge}"
+        )
+    return edge
+
+
+def resolve_minimax_h3_reference_image_shape(
+    image: Image.Image,
+    short_edge: int | None = None,
+) -> tuple[int, int]:
+    """Resize an H3 reference image to the reference canvas (official 2048 short edge)."""
     width, height = image.size
     ratio = width / height
     if not 0.4 <= ratio <= 2.5:
         raise OmniClientError(f"reference image aspect ratio must be in [0.4, 2.5], got {width}x{height}")
     if min(width, height) < 256 or max(width, height) > 5760:
         raise OmniClientError(f"reference image dimensions must be in [256, 5760] pixels, got {width}x{height}")
-    scale = MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / min(width, height)
+    target = resolve_minimax_h3_reference_short_edge(short_edge)
+    scale = target / min(width, height)
     return (
         _align_multiple(width * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
         _align_multiple(height * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
@@ -490,4 +529,5 @@ __all__ = [
     "resolve_minimax_h3_aspect_ratio",
     "resolve_minimax_h3_output_canvas",
     "resolve_minimax_h3_reference_image_shape",
+    "resolve_minimax_h3_reference_short_edge",
 ]
