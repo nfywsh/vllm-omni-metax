@@ -169,6 +169,11 @@ def resolve_minimax_h3_reference_short_edge(value: Any) -> int:
     return edge
 
 
+def _ref_no_upscale_enabled() -> bool:
+    """Whether reference images must not be upscaled past their native size."""
+    return os.environ.get("H3_REF_NO_UPSCALE", "").strip() in {"1", "true", "True"}
+
+
 def resolve_minimax_h3_reference_image_shape(
     image: Image.Image,
     short_edge: int | None = None,
@@ -182,6 +187,11 @@ def resolve_minimax_h3_reference_image_shape(
         raise OmniClientError(f"reference image dimensions must be in [256, 5760] pixels, got {width}x{height}")
     target = resolve_minimax_h3_reference_short_edge(short_edge)
     scale = target / min(width, height)
+    if scale > 1.0 and _ref_no_upscale_enabled():
+        # 不把小图放大到参考画布：上采样不产生新信息，却把 VAE 编码耗时与
+        # token 数按面积放大（1024px -> 2048 短边是 4 倍）。默认关闭以保持
+        # 官方行为，H3_REF_NO_UPSCALE=1 时启用。
+        scale = 1.0
     return (
         _align_multiple(width * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
         _align_multiple(height * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
