@@ -64,6 +64,35 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# --- H3 DiT 分块计时（仅 H3_DIT_PROF=1 生效，默认零开销）-------------------
+import os as _os
+
+_DIT_PROF_ON = _os.environ.get("H3_DIT_PROF") == "1"
+_DIT_PROF = {"blocks": 0, "adaln_norm": 0.0, "attn": 0.0, "gate_norm": 0.0, "mlp": 0.0}
+_DIT_PROF_EVENTS: list = []
+
+
+def _dit_prof_dump() -> None:
+    """同步一次后统一结算（逐个 elapsed_time 会要求事件已完成）。"""
+    if not _DIT_PROF_ON or not _DIT_PROF_EVENTS:
+        return
+    torch.cuda.synchronize()
+    for ev in _DIT_PROF_EVENTS:
+        _DIT_PROF["adaln_norm"] += ev[0].elapsed_time(ev[1]) / 1000.0
+        _DIT_PROF["attn"] += ev[1].elapsed_time(ev[2]) / 1000.0
+        _DIT_PROF["gate_norm"] += ev[2].elapsed_time(ev[3]) / 1000.0
+        _DIT_PROF["mlp"] += ev[3].elapsed_time(ev[4]) / 1000.0
+        _DIT_PROF["blocks"] += 1
+    _DIT_PROF_EVENTS.clear()
+    total = _DIT_PROF["adaln_norm"] + _DIT_PROF["attn"] + _DIT_PROF["gate_norm"] + _DIT_PROF["mlp"]
+    logger.info(
+        "[H3_DIT_PROF] blocks=%d adaln_norm=%.2fs attn=%.2fs gate_norm=%.2fs mlp=%.2fs sum=%.2fs",
+        _DIT_PROF["blocks"], _DIT_PROF["adaln_norm"], _DIT_PROF["attn"],
+        _DIT_PROF["gate_norm"], _DIT_PROF["mlp"], total,
+    )
+    for key in ("blocks", "adaln_norm", "attn", "gate_norm", "mlp"):
+        _DIT_PROF[key] = 0.0
+
 
 # Packed multi-request forwards require the attention backend to actually
 # consume cu_seqlens as a block-diagonal plan (not a padding-mask rebuild that
@@ -903,6 +932,11 @@ class MiniMaxH3DiTBlock(nn.Module):
         norm1 -> scale/shift -> attention -> gated residual, followed by
         norm2 -> scale/shift -> MLP -> gated residual.
         """
+        _ev = None
+        if _DIT_PROF_ON:
+            _ev = [torch.cuda.Event(enable_timing=True) for _ in range(5)]
+            _DIT_PROF_EVENTS.append(_ev)
+            _ev[0].record()
         (
             shift_msa,
             scale_msa,
@@ -921,6 +955,8 @@ class MiniMaxH3DiTBlock(nn.Module):
             combined_indices,
             self.norm1.variance_epsilon,
         )
+        if _ev is not None:
+            _ev[1].record()
         h = self.attn(
             h,
             rope_table=rope_table,
@@ -932,6 +968,8 @@ class MiniMaxH3DiTBlock(nn.Module):
             video_layout=video_layout,
             vsa_prefix_segments=vsa_prefix_segments,
         )
+        if _ev is not None:
+            _ev[2].record()
         x, h = indexed_gate_rms_norm_scale_shift(
             residual,
             gate_msa,
@@ -942,8 +980,12 @@ class MiniMaxH3DiTBlock(nn.Module):
             combined_indices,
             self.norm2.variance_epsilon,
         )
+        if _ev is not None:
+            _ev[3].record()
         residual = x
         h = self.mlp(h)
+        if _ev is not None:
+            _ev[4].record()
         return indexed_gate(residual, gate_mlp, h, combined_indices)
 
 

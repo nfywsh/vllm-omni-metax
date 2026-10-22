@@ -735,11 +735,14 @@ class MiniMaxH3Pipeline(
     )
     _PROFILER_TARGETS: ClassVar[list[str]] = [
         "_prepare_reference_videos",
+        "_prepare_request_inputs",
         "encode_prompt",
         "_encode_visual_conditions",
         "_encode_reference_audio_conditions",
         "diffuse",
+        "_build_denoise_inputs",
         "decode",
+        "decode_to_mp4",
         "video_vae.decode_latent",
         "audio_vae.decode_latent",
         "prepare_encode",
@@ -2356,6 +2359,10 @@ class MiniMaxH3Pipeline(
         height: int,
         width: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if os.environ.get("H3_DIT_PROF") == "1":
+            from .minimax_h3_transformer import _dit_prof_dump
+
+            _dit_prof_dump()
         _dbg = os.environ.get("H3_STAGE_DBG") == "1"
         if _dbg:
             logger.info(
