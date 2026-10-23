@@ -52,6 +52,57 @@ def _maybe_reshape_attn_mask(
     return attn_mask
 
 
+def _h3_sparse_override(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_metadata: AttentionMetadata,
+    softmax_scale: float,
+) -> torch.Tensor | None:
+    """MiniMax-H3 opt-in block-sparse attention for the packed SDPA layout.
+
+    Confined to metadata that publishes a ``VideoTokenLayout`` carrying both
+    ``used_len`` and ``prefix_len`` -- i.e. MiniMax-H3 -- and gated by
+    ``H3_BSA_ENABLE=1``. Returns ``None`` for every other model and whenever
+    the sparse kernel is unusable, so the dense call below is unchanged.
+    """
+
+    layout = getattr(attn_metadata, "video_layout", None)
+    used_len = None if layout is None else getattr(layout, "used_len", None)
+    prefix_len = None if layout is None else getattr(layout, "prefix_len", None)
+    if prefix_len is None:
+        # Ref2VA publishes used_len + video_spans instead of a single
+        # prefix_len; the non-video head is everything before the target
+        # video rows, and those rows must stay visible to every query.
+        spans = () if layout is None else (getattr(layout, "video_spans", ()) or ())
+        starts = [int(span.start) for span in spans if getattr(span, "role", "") == "target"]
+        if not starts:
+            starts = [int(span.start) for span in spans]
+        prefix_len = min(starts) if starts else None
+    if used_len is None or prefix_len is None:
+        return None
+    if query.shape[2] != key.shape[2]:
+        # The kernel call assumes one head group per KV head.
+        return None
+
+    from vllm_omni.diffusion.attention.backends.h3_bsa import (
+        h3_bsa_enabled,
+        h3_block_sparse_attention_single,
+    )
+
+    if not h3_bsa_enabled():
+        return None
+    out = h3_block_sparse_attention_single(
+        query[0],
+        key[0],
+        value[0],
+        used_len=int(used_len),
+        prefix_len=int(prefix_len),
+        softmax_scale=softmax_scale,
+    )
+    return None if out is None else out.unsqueeze(0)
+
+
 class SDPABackend(AttentionBackend):
     accept_output_buffer: bool = True
 
@@ -103,6 +154,17 @@ class SDPAImpl(AttentionImpl):
         attention_mask = None
         if attn_metadata:
             attention_mask = _maybe_reshape_attn_mask(query, key, attn_metadata.attn_mask, mask_mode=mask_mode)
+
+        if attn_metadata is not None and not self.causal and query.shape[0] == 1:
+            sparse_out = _h3_sparse_override(
+                query,
+                key,
+                value,
+                attn_metadata,
+                self.softmax_scale,
+            )
+            if sparse_out is not None:
+                return sparse_out
 
         enable_gqa = query.shape[2] != key.shape[2]
         query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))

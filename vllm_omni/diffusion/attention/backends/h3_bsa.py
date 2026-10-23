@@ -105,7 +105,9 @@ def _load_kernel():
 
 
 @torch.no_grad()
-def _topk_block_mask(q: torch.Tensor, k: torch.Tensor, sparsity: float) -> torch.Tensor:
+def _topk_block_mask(
+    q: torch.Tensor, k: torch.Tensor, sparsity: float, prefix_blocks: int = 0
+) -> torch.Tensor:
     """Per-head top-k block mask + forced locality/keyframe anchors.
 
     q, k: [S, H, D] rows padded to a multiple of _BLOCK. Returns [1, H, nb, nb]
@@ -139,6 +141,11 @@ def _topk_block_mask(q: torch.Tensor, k: torch.Tensor, sparsity: float) -> torch
         # every query block, which pure content top-k does not guarantee.
         forced[:, 0] = True
         forced[:, -1] = True
+    if prefix_blocks > 0:
+        # SDPA layouts keep text, visual conditions and audio in the sequence
+        # prefix. Every query row must still see them, or the video loses
+        # prompt adherence and keyframe identity.
+        forced[:, : min(int(prefix_blocks), nb)] = True
     if forced.any():
         mask |= forced.unsqueeze(0)
     return mask.unsqueeze(0)
@@ -317,7 +324,123 @@ def _run(
     return out
 
 
+@torch.no_grad()
+def h3_block_sparse_attention_single(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    used_len: int,
+    prefix_len: int,
+    softmax_scale: float,
+) -> torch.Tensor | None:
+    """Whole-sequence block-sparse attention for the packed SDPA layout.
+
+    The SDPA backend attends one packed row as a single document, so unlike
+    :func:`h3_block_sparse_attention` there are no cu_seqlens segments to
+    split on. ``prefix_len`` marks the leading rows that are not video (text,
+    visual conditions, audio); their blocks stay visible to every query.
+
+    Returns ``None`` -- after one warning -- when the kernel cannot be
+    imported or the shapes are unsupported, so the caller keeps SDPA.
+    """
+    try:
+        return _run_single(
+            q,
+            k,
+            v,
+            used_len=used_len,
+            prefix_len=prefix_len,
+            softmax_scale=softmax_scale,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning_once(
+            "H3 block-sparse attention unavailable (%s: %s); using dense attention.",
+            type(exc).__name__,
+            exc,
+        )
+        return None
+
+
+@torch.no_grad()
+def _run_single(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    used_len: int,
+    prefix_len: int,
+    softmax_scale: float,
+) -> torch.Tensor | None:
+    if not q.is_cuda:
+        raise RuntimeError("block-sparse attention requires a CUDA/MACA device")
+    if q.shape != k.shape or q.shape != v.shape:
+        raise ValueError(f"expects matching q/k/v rows, got {tuple(q.shape)}/{tuple(k.shape)}/{tuple(v.shape)}")
+    if q.shape[-1] != _BLOCK:
+        raise ValueError(f"head dim {q.shape[-1]} is unsupported (the kernel expects {_BLOCK})")
+
+    length = int(used_len)
+    if length < _MIN_SPARSE_BLOCKS * _BLOCK:
+        # Too short to be worth sparsifying: let the dense backend handle it.
+        return None
+    if length > q.shape[0]:
+        raise ValueError(f"used_len {length} exceeds the packed rows {q.shape[0]}")
+
+    bsa = _load_kernel()
+    qs, ks, vs = q[:length], k[:length], v[:length]
+    pad = (-length) % _BLOCK
+    if pad:
+        span = min(length, 4096)
+        src = length - 1 - (torch.arange(pad, device=q.device) * 97) % span
+        qs = torch.nn.functional.pad(qs, (0, 0, 0, 0, 0, pad))
+        ks = torch.cat([ks, ks[src]], dim=0)
+        vs = torch.cat([vs, vs[src]], dim=0)
+    if qs.dtype != torch.bfloat16:
+        qs, ks, vs = (tensor.to(torch.bfloat16) for tensor in (qs, ks, vs))
+
+    sparsity = _sparsity()
+    heads = qs.shape[1]
+    seq_padded = qs.shape[0]
+    prefix_blocks = (max(int(prefix_len), 0) + _BLOCK - 1) // _BLOCK
+    logger.info_once(
+        "MiniMax-H3 block-sparse attention active (single-doc/SDPA): sparsity=%.2f, "
+        "window=%d, rows %d (+%d pad) of %d, prefix rows %d (%d blocks forced)",
+        sparsity,
+        _window(),
+        length,
+        pad,
+        q.shape[0],
+        int(prefix_len),
+        prefix_blocks,
+    )
+    mask = _topk_block_mask(qs, ks, sparsity, prefix_blocks=prefix_blocks)
+    cu = torch.tensor([0, seq_padded], device=q.device, dtype=torch.int32)
+    head_mask_type = torch.ones(heads, device=q.device, dtype=torch.int32)
+    result = bsa.block_sparse_attn_func(
+        qs,
+        ks,
+        vs,
+        cu,
+        cu,
+        head_mask_type,
+        None,
+        mask,
+        seq_padded,
+        seq_padded,
+        0.0,
+        deterministic=False,
+        softmax_scale=softmax_scale,
+        is_causal=False,
+        exact_streaming=False,
+        return_attn_probs=False,
+    )
+    out = torch.zeros_like(v)
+    out[:length] = result[:length].to(v.dtype)
+    return out
+
+
 __all__ = [
     "h3_block_sparse_attention",
+    "h3_block_sparse_attention_single",
     "h3_bsa_enabled",
 ]
