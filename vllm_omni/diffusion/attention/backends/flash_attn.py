@@ -19,6 +19,16 @@ from vllm_omni.platforms import current_omni_platform
 logger = init_logger(__name__)
 
 
+def _h3_bsa_enabled() -> bool:
+    """Whether the opt-in MiniMax-H3 block-sparse path may run.
+
+    Off unless ``H3_BSA_ENABLE=1``; the module and its kernel are never
+    imported while it is off. Compiled regions keep the dense kernel: the
+    sparse path allocates a per-layer block mask in eager Python.
+    """
+    return os.environ.get("H3_BSA_ENABLE", "0") == "1" and not torch.compiler.is_compiling()
+
+
 class FlashAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
     supports_piecewise_spans: bool = True
@@ -220,6 +230,26 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             raise ImportError("Packed variable-length attention requires flash_attn_varlen_func")
         if query.shape[0] != 1 or key.shape[0] != 1 or value.shape[0] != 1:
             raise ValueError("Packed variable-length attention currently requires batch size 1")
+
+        if _h3_bsa_enabled():
+            # MiniMax-H3 opt-in: the longest packed segment runs on the
+            # block-sparse kernel, every other segment keeps the dense kernel.
+            # ``None`` means the kernel or the shapes were unusable, so the
+            # dense call below runs exactly as before.
+            from vllm_omni.diffusion.attention.backends.h3_bsa import (
+                h3_block_sparse_attention,
+            )
+
+            sparse_out = h3_block_sparse_attention(
+                query[0],
+                key[0],
+                value[0],
+                cu_seqlens=cu_seqlens_q,
+                max_seqlen=max_seqlen_q,
+                softmax_scale=self.softmax_scale,
+            )
+            if sparse_out is not None:
+                return sparse_out.unsqueeze(0)
 
         out = flash_attn_varlen_func(
             q=query.flatten(0, 1),
