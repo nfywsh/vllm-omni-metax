@@ -169,6 +169,45 @@ def resolve_minimax_h3_reference_short_edge(value: Any) -> int:
     return edge
 
 
+MINIMAX_H3_BSA_SPARSITY_VALUES = (0.0, 0.5)
+
+
+def resolve_minimax_h3_bsa_sparsity(value: Any) -> float | None:
+    """Resolve a per-request block-sparse attention switch (``bsa_sparsity``).
+
+    ``None`` keeps the engine default (``H3_BSA_ENABLE``). Only two positions
+    are accepted: ``0`` disables block-sparse attention for this request, and
+    ``0.5`` enables it. Anything else is rejected rather than clamped: the
+    first quality sweep showed 0.65 drops reference identity, so this knob is
+    deliberately a switch, not a dial.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return 0.0 if not value else MINIMAX_H3_BSA_SPARSITY_VALUES[1]
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"", "off", "none", "false", "0"}:
+            return 0.0
+        try:
+            value = float(text)
+        except ValueError as exc:
+            raise OmniClientError(
+                f"MiniMax H3 bsa_sparsity must be one of {list(MINIMAX_H3_BSA_SPARSITY_VALUES)}, got {value!r}"
+            ) from exc
+    try:
+        sparsity = float(value)
+    except (TypeError, ValueError) as exc:
+        raise OmniClientError(
+            f"MiniMax H3 bsa_sparsity must be one of {list(MINIMAX_H3_BSA_SPARSITY_VALUES)}, got {value!r}"
+        ) from exc
+    if not any(abs(sparsity - allowed) < 1e-6 for allowed in MINIMAX_H3_BSA_SPARSITY_VALUES):
+        raise OmniClientError(
+            f"MiniMax H3 bsa_sparsity must be one of {list(MINIMAX_H3_BSA_SPARSITY_VALUES)}, got {value!r}"
+        )
+    return 0.0 if sparsity == 0.0 else MINIMAX_H3_BSA_SPARSITY_VALUES[1]
+
+
 def _ref_no_upscale_enabled() -> bool:
     """Whether reference images must not be upscaled past their native size."""
     return os.environ.get("H3_REF_NO_UPSCALE", "").strip() in {"1", "true", "True"}
@@ -539,5 +578,6 @@ __all__ = [
     "resolve_minimax_h3_aspect_ratio",
     "resolve_minimax_h3_output_canvas",
     "resolve_minimax_h3_reference_image_shape",
+    "resolve_minimax_h3_bsa_sparsity",
     "resolve_minimax_h3_reference_short_edge",
 ]

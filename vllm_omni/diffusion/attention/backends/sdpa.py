@@ -89,8 +89,16 @@ def _h3_sparse_override(
         h3_bsa_enabled,
         h3_block_sparse_attention_single,
     )
+    from vllm_omni.diffusion.forward_context import get_h3_bsa_sparsity
 
-    if not h3_bsa_enabled():
+    # A per-request value wins over the engine-wide switch: 0 disables
+    # block-sparse attention for this request, >0 enables it, and None keeps
+    # the H3_BSA_ENABLE default.
+    requested = get_h3_bsa_sparsity()
+    if requested is None:
+        if not h3_bsa_enabled():
+            return None
+    elif requested <= 0.0:
         return None
     out = h3_block_sparse_attention_single(
         query[0],
@@ -99,6 +107,7 @@ def _h3_sparse_override(
         used_len=int(used_len),
         prefix_len=int(prefix_len),
         softmax_scale=softmax_scale,
+        sparsity=requested,
     )
     return None if out is None else out.unsqueeze(0)
 

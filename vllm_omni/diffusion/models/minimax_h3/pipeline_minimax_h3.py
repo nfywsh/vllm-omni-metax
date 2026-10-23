@@ -35,7 +35,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     init_world_group,
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
+from vllm_omni.diffusion.forward_context import DenoiseProgressMixin, set_h3_bsa_sparsity
 from vllm_omni.diffusion.model_loader.diffusers_loader import (
     DiffusersPipelineLoader,
 )
@@ -96,6 +96,7 @@ from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
     resolve_minimax_h3_reference_image_shape as _reference_image_shape,
 )
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
+    resolve_minimax_h3_bsa_sparsity as _bsa_sparsity,
     resolve_minimax_h3_reference_short_edge as _reference_short_edge,
 )
 from vllm_omni.model_executor.models.minimax_h3.reference_video import (
@@ -2468,6 +2469,16 @@ class MiniMaxH3Pipeline(
         quality = sampling.quality
         logger.debug("MiniMax H3 request quality=%s", quality)
         extra = sampling.extra_args or {}
+        _bsa_target = extra.get("target")
+        _bsa_target = _bsa_target if isinstance(_bsa_target, Mapping) else {}
+        bsa_sparsity = _bsa_sparsity(
+            _bsa_target.get("bsa_sparsity", extra.get("bsa_sparsity"))
+        )
+        # Request-scoped: every request publishes its own value (None when the
+        # caller did not ask), so a previous request cannot leak into this one.
+        set_h3_bsa_sparsity(bsa_sparsity)
+        if bsa_sparsity is not None:
+            logger.info("MiniMax H3 request bsa_sparsity=%.2f", bsa_sparsity)
         preencode_batch_frames = (
             normalize_preencode_batch_frames(extra.get("preencode_batch_frames", 17))
             if extra.get("preencode_mp4", False)

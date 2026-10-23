@@ -3527,6 +3527,35 @@ async def _persist_uploaded_media_references(
     return images, videos, audios
 
 
+def _validate_minimax_h3_client_params(request: Any) -> None:
+    """Reject invalid MiniMax-H3 per-request knobs while still on the API side.
+
+    The engine validates the same values, but an engine-side rejection crosses
+    the worker RPC hop as a generic engine error, so a bad user input would
+    surface as a 500. Validating here keeps input mistakes on 400 and avoids
+    decoding/persisting reference media for a request that cannot run.
+    """
+
+    extra = getattr(request, "extra_params", None)
+    if not isinstance(extra, dict):
+        return
+    target = extra.get("target")
+    target = target if isinstance(target, dict) else {}
+
+    from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
+        resolve_minimax_h3_bsa_sparsity,
+        resolve_minimax_h3_reference_short_edge,
+    )
+
+    try:
+        resolve_minimax_h3_bsa_sparsity(target.get("bsa_sparsity", extra.get("bsa_sparsity")))
+        resolve_minimax_h3_reference_short_edge(
+            target.get("reference_short_edge", extra.get("reference_short_edge"))
+        )
+    except OmniClientError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+
+
 async def _parse_video_form(
     raw_request: Request,
     prompt: str = Form(...),
@@ -3641,6 +3670,7 @@ async def _parse_video_form(
     }
     request_data = {k: v for k, v in request_data.items() if v is not None}
     request = VideoGenerationRequest(**request_data)
+    _validate_minimax_h3_client_params(request)
 
     handler = Omnivideo(raw_request)
     if handler is None:

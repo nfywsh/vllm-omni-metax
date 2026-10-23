@@ -324,6 +324,50 @@ def _run(
     return out
 
 
+_LAST_SINGLE_LOG: tuple[float, int, bool] | None = None
+
+
+def _log_single_request(
+    sparsity: float | None,
+    length: int,
+    prefix_rows: int,
+    prefix_blocks: int,
+    *,
+    engaged: bool,
+) -> None:
+    """One line per request, not per layer/step.
+
+    The attention module runs once per layer per denoise step (~200 calls for a
+    four-step H3 request), so the log is deduplicated on the tuple that changes
+    only when a new request starts. Workers serve one request at a time, which
+    makes a module-level key safe here.
+    """
+    global _LAST_SINGLE_LOG
+    resolved = _sparsity() if sparsity is None else float(sparsity)
+    key = (resolved, int(length), bool(engaged))
+    if _LAST_SINGLE_LOG == key:
+        return
+    _LAST_SINGLE_LOG = key
+    if engaged:
+        logger.info(
+            "MiniMax-H3 block-sparse attention requested=%.2f engaged=true: "
+            "rows %d, prefix rows %d (%d blocks forced), window=%d",
+            resolved,
+            int(length),
+            int(prefix_rows),
+            int(prefix_blocks),
+            _window(),
+        )
+    else:
+        logger.info(
+            "MiniMax-H3 block-sparse attention requested=%.2f engaged=false: "
+            "rows %d < %d minimum, using dense SDPA",
+            resolved,
+            int(length),
+            _MIN_SPARSE_BLOCKS * _BLOCK,
+        )
+
+
 @torch.no_grad()
 def h3_block_sparse_attention_single(
     q: torch.Tensor,
@@ -333,6 +377,7 @@ def h3_block_sparse_attention_single(
     used_len: int,
     prefix_len: int,
     softmax_scale: float,
+    sparsity: float | None = None,
 ) -> torch.Tensor | None:
     """Whole-sequence block-sparse attention for the packed SDPA layout.
 
@@ -352,6 +397,7 @@ def h3_block_sparse_attention_single(
             used_len=used_len,
             prefix_len=prefix_len,
             softmax_scale=softmax_scale,
+            sparsity=sparsity,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning_once(
@@ -371,6 +417,7 @@ def _run_single(
     used_len: int,
     prefix_len: int,
     softmax_scale: float,
+    sparsity: float | None = None,
 ) -> torch.Tensor | None:
     if not q.is_cuda:
         raise RuntimeError("block-sparse attention requires a CUDA/MACA device")
@@ -382,6 +429,7 @@ def _run_single(
     length = int(used_len)
     if length < _MIN_SPARSE_BLOCKS * _BLOCK:
         # Too short to be worth sparsifying: let the dense backend handle it.
+        _log_single_request(sparsity, length, 0, 0, engaged=False)
         return None
     if length > q.shape[0]:
         raise ValueError(f"used_len {length} exceeds the packed rows {q.shape[0]}")
@@ -398,21 +446,13 @@ def _run_single(
     if qs.dtype != torch.bfloat16:
         qs, ks, vs = (tensor.to(torch.bfloat16) for tensor in (qs, ks, vs))
 
-    sparsity = _sparsity()
+    if sparsity is None:
+        sparsity = _sparsity()
+    sparsity = float(sparsity)
     heads = qs.shape[1]
     seq_padded = qs.shape[0]
     prefix_blocks = (max(int(prefix_len), 0) + _BLOCK - 1) // _BLOCK
-    logger.info_once(
-        "MiniMax-H3 block-sparse attention active (single-doc/SDPA): sparsity=%.2f, "
-        "window=%d, rows %d (+%d pad) of %d, prefix rows %d (%d blocks forced)",
-        sparsity,
-        _window(),
-        length,
-        pad,
-        q.shape[0],
-        int(prefix_len),
-        prefix_blocks,
-    )
+    _log_single_request(sparsity, length, int(prefix_len), prefix_blocks, engaged=True)
     mask = _topk_block_mask(qs, ks, sparsity, prefix_blocks=prefix_blocks)
     cu = torch.tensor([0, seq_padded], device=q.device, dtype=torch.int32)
     head_mask_type = torch.ones(heads, device=q.device, dtype=torch.int32)

@@ -303,6 +303,27 @@ def set_forward_context_denoise_total_steps(total_steps: int | None) -> None:
         _forward_context.total_denoise_steps = total_steps
 
 
+_h3_bsa_sparsity: float | None = None
+
+
+def set_h3_bsa_sparsity(sparsity: float | None) -> None:
+    """Publish the per-request MiniMax-H3 block-sparse sparsity.
+
+    Request-scoped rather than forward-scoped on purpose: ``set_forward_context``
+    builds a fresh ForwardContext for every model call, so a value published
+    once before the denoise loop would be dropped on the next forward. Pipelines
+    must call this for every request (``None`` means "not requested"), which
+    keeps a failed request from leaking its setting into the next one.
+    """
+    global _h3_bsa_sparsity
+    _h3_bsa_sparsity = None if sparsity is None else float(sparsity)
+
+
+def get_h3_bsa_sparsity() -> float | None:
+    """Current request's block-sparse sparsity, or ``None`` when unset."""
+    return _h3_bsa_sparsity
+
+
 class DenoiseProgressMixin:
     def record_denoise_step(
         self,
